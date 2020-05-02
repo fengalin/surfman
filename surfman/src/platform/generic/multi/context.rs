@@ -116,6 +116,7 @@ impl<Def, Alt> Device<Def, Alt> where Def: DeviceInterface, Alt: DeviceInterface
     /// 
     /// The context must have been created on this device.
     pub fn destroy_context(&self, context: &mut Context<Def, Alt>) -> Result<(), Error> {
+        println!("destroy_context gen multi");
         match (self, &mut *context) {
             (&Device::Default(ref device), &mut Context::Default(ref mut context)) => {
                 device.destroy_context(context)

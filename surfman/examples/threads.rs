@@ -16,12 +16,14 @@ use self::common::FilesystemResourceLoader;
 
 #[cfg(not(target_os = "android"))]
 use surfman::{ContextAttributeFlags, ContextAttributes, GLVersion};
+
 #[cfg(not(target_os = "android"))]
-use winit::dpi::PhysicalSize;
-#[cfg(not(target_os = "android"))]
-use winit::{DeviceEvent, Event, EventsLoop, KeyboardInput, VirtualKeyCode};
-#[cfg(not(target_os = "android"))]
-use winit::{WindowBuilder, WindowEvent};
+use winit::{
+    dpi::LogicalSize,
+    event::{Event, KeyboardInput, VirtualKeyCode, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
 
 pub mod common;
 
@@ -84,16 +86,14 @@ static BACKGROUND_COLOR: [f32; 4] = [
 
 #[cfg(not(target_os = "android"))]
 fn main() {
-    let mut event_loop = EventsLoop::new();
-    let dpi = event_loop.get_primary_monitor().get_hidpi_factor();
+    let event_loop = EventLoop::new();
     let window_size = Size2D::new(WINDOW_WIDTH, WINDOW_HEIGHT);
-    let logical_size =
-        PhysicalSize::new(window_size.width as f64, window_size.height as f64).to_logical(dpi);
+    let logical_size = LogicalSize::new(window_size.width, window_size.height);
     let window = WindowBuilder::new().with_title("Multithreaded example")
-                                     .with_dimensions(logical_size)
+                                     .with_inner_size(logical_size)
+                                     .with_resizable(false)
                                      .build(&event_loop)
                                      .unwrap();
-    window.show();
 
     let connection = Connection::from_winit_window(&window).unwrap();
     let native_widget = connection.create_native_widget_from_winit_window(&window).unwrap();
@@ -118,30 +118,34 @@ fn main() {
                            context,
                            Box::new(FilesystemResourceLoader),
                            window_size);
-    let mut exit = false;
 
-    while !exit {
-        app.tick(true);
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
 
-        event_loop.poll_events(|event| {
-            match event {
-                Event::WindowEvent { event: WindowEvent::Destroyed, .. } |
-                Event::DeviceEvent {
-                    event: DeviceEvent::Key(KeyboardInput {
-                        virtual_keycode: Some(VirtualKeyCode::Escape),
+        match event {
+            Event::RedrawEventsCleared => app.tick(true),
+            Event::WindowEvent { event, .. } => {
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        input: KeyboardInput {
+                            virtual_keycode: Some(VirtualKeyCode::Escape),
+                            ..
+                        },
                         ..
-                    }),
-                    ..
-                } => exit = true,
-                _ => {}
+                    } => *control_flow = ControlFlow::Exit,
+                    _ => (),
+                }
             }
-        });
-    }
+            Event::LoopDestroyed => app.quit(),
+            _ => {}
+        }
+    });
 }
 
 pub struct App {
     main_from_worker_receiver: Receiver<Frame>,
-    main_to_worker_sender: Sender<Surface>,
+    main_to_worker_sender: Option<Sender<Surface>>,
     grid_vertex_array: GridVertexArray,
     blit_vertex_array: BlitVertexArray,
     device: Device,
@@ -197,7 +201,7 @@ impl App {
 
         App {
             main_from_worker_receiver,
-            main_to_worker_sender,
+            main_to_worker_sender: Some(main_to_worker_sender),
             grid_vertex_array,
             blit_vertex_array,
             device,
@@ -208,12 +212,30 @@ impl App {
         }
     }
 
+    pub fn quit(&mut self) {
+        if self.main_to_worker_sender.take().is_some() {
+            while self.main_from_worker_receiver.recv().is_ok() {}
+
+            if let Some(texture) = self.texture.take() {
+                let _surface = self
+                    .device
+                    .destroy_surface_texture(&mut self.context, texture).unwrap();
+            }
+            self.device.destroy_context(&mut self.context).unwrap();
+        }
+    }
+
     pub fn tick(&mut self, present: bool) {
+        let main_to_worker_sender = match self.main_to_worker_sender.as_mut() {
+            Some(main_to_worker_sender) => main_to_worker_sender,
+            None => return,
+        };
+
         // Send back our old surface.
         let surface = self.device
                           .destroy_surface_texture(&mut self.context, self.texture.take().unwrap())
                           .unwrap();
-        self.main_to_worker_sender.send(surface).unwrap();
+        main_to_worker_sender.send(surface).unwrap();
 
         // Fetch a new frame.
         self.frame = self.main_from_worker_receiver.recv().unwrap();
@@ -422,13 +444,19 @@ fn worker_thread(connection: Connection,
         }
 
         let old_surface = device.unbind_surface_from_context(&mut context).unwrap();
-        let new_surface = worker_from_main_receiver.recv().unwrap();
-        device.bind_surface_to_context(&mut context, new_surface).unwrap();
         worker_to_main_sender.send(Frame {
             surface: old_surface,
             viewport_origin: ball_rect.origin - subscreen_offset,
             sphere_position: ball_rect.center(),
         }).unwrap();
+
+        match worker_from_main_receiver.recv() {
+            Ok(new_surface) => device.bind_surface_to_context(&mut context, new_surface).unwrap(),
+            Err(_) => {
+                device.destroy_context(&mut context).unwrap();
+                return;
+            }
+        };
 
         // Advance ball.
         ball_velocity += Vector2D::new(0.0, GRAVITY);
